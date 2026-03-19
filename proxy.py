@@ -1,262 +1,198 @@
 import re
-import requests
+import os
 import traceback
-import threading
-from queue import Queue
 import time
+import shutil
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import dataclass
+from typing import Optional, Dict, Any, Callable
+import requests
 from flask_caching import Cache
-from functools import cache
-from urllib.parse import unquote
 from flask import Flask, abort, request, jsonify, redirect
 from cover import download_image_async
 from search import get_album_info, get_artist_profile, get_artist_top_songs, get_similar_songs  # type: ignore
 
 app = Flask(__name__)
 
-# ========== 并行查询工具函数 ==========
+# ========== 常量定义 ==========
+SENSITIVE_PARAMS = ['api_key', 'token', 'password', 'secret', 'key']
+DEFAULT_TIMEOUT = 9  # 默认超时时间（秒）
+CACHE_TIMEOUT = 86400  # 缓存默认过期时间（秒）
+CACHE_THRESHOLD = 1000  # 最大缓存项数
 
-def parallel_query_artist_info(artist_name, lastfm_api_url, get_artist_profile_func, timeout=9):
-    """并行查询艺术家信息（9秒超时）"""
-    netease_data = None
-    lastfm_data = None
-    netease_success = False
-    lastfm_success = False
-    netease_error = None
-    lastfm_error = None
+# ========== 数据结构 ==========
+
+@dataclass
+class QueryResult:
+    """查询结果封装类"""
+    netease_data: Optional[Dict[str, Any]] = None
+    lastfm_data: Optional[Dict[str, Any]] = None
+    netease_success: bool = False
+    lastfm_success: bool = False
+    elapsed_time: float = 0
+    netease_error: Optional[str] = None
+    lastfm_error: Optional[str] = None
+
+# ========== 工具函数 ==========
+
+def filter_sensitive_params(params_dict: Dict[str, Any], redact: bool = False) -> Dict[str, Any]:
+    """过滤或隐藏敏感参数"""
+    result = {}
+    for key, value in params_dict.items():
+        is_sensitive = any(sensitive in key.lower() for sensitive in SENSITIVE_PARAMS)
+        if is_sensitive:
+            if redact:
+                result[key] = '[REDACTED]'
+            # 不 redact 时跳过该参数
+        else:
+            result[key] = value
+    return result
+
+def build_image_array(small_url: str, large_url: str) -> list:
+    """构建标准 Last.fm 格式的 image 数组"""
+    return [
+        {"#text": small_url, "size": "small"},
+        {"#text": small_url, "size": "medium"},
+        {"#text": large_url, "size": "large"},
+        {"#text": large_url, "size": "extralarge"},
+        {"#text": large_url, "size": "mega"},
+        {"#text": large_url, "size": ""}
+    ]
+
+def log_query_result(method_name: str, netease_success: bool, lastfm_success: bool,
+                     netease_error: Optional[str], lastfm_error: Optional[str], 
+                     identifier: str, elapsed_time: float):
+    """统一记录查询结果日志"""
+    app.logger.debug(f"{method_name}并行查询总耗时: {elapsed_time:.2f}秒")
     
-    netease_result = Queue()
-    lastfm_result = Queue()
+    if netease_success:
+        app.logger.debug(f"成功获取网易云数据: {identifier}")
+    elif netease_error:
+        if netease_error == "Timeout":
+            app.logger.warning(f"网易云查询超时: {identifier}")
+        else:
+            app.logger.error(f"网易云查询异常: {netease_error}")
+    
+    if lastfm_success:
+        app.logger.debug(f"成功获取Last.fm数据: {identifier}")
+    elif lastfm_error:
+        if lastfm_error == "Timeout":
+            app.logger.warning(f"Last.fm查询超时: {identifier}")
+        else:
+            app.logger.error(f"Last.fm查询异常: {lastfm_error}")
+
+def parallel_query(netease_fetch_func: Callable, lastfm_api_url: str, timeout: int = DEFAULT_TIMEOUT) -> QueryResult:
+    """
+    通用并行查询函数，同时查询网易云和Last.fm数据
+    :param netease_fetch_func: 获取网易云数据的函数
+    :param lastfm_api_url: Last.fm API URL
+    :param timeout: 超时时间（秒）
+    :return: QueryResult 对象
+    """
+    result = QueryResult()
     start_time = time.time()
     
     def fetch_netease_data():
         try:
-            artist_name_1 = None
-            if any(substring in artist_name for substring in [' and ', "&"]):
-                sp = re.split(r" and |&", artist_name)
-                artist_name_1 = sp[0]
-            
-            artist_profile = get_artist_profile_func(artist_name)
-            if not artist_profile and artist_name_1 is not None:
-                artist_profile = get_artist_profile_func(artist_name_1)
-            
-            if artist_profile:
-                netease_result.put(('success', artist_profile['artist']))
+            data = netease_fetch_func()
+            if data:
+                return ('success', data)
             else:
-                netease_result.put(('no_data', None))
+                return ('no_data', None)
         except Exception as e:
-            netease_result.put(('error', e))
+            return ('error', e)
     
     def fetch_lastfm_data():
         try:
-            lastfm_response = requests.get(lastfm_api_url, timeout=timeout)
+            lastfm_response = session.get(lastfm_api_url, timeout=timeout)
             if lastfm_response.status_code == 200:
                 lastfm_data = lastfm_response.json()
                 if 'error' not in lastfm_data:
-                    lastfm_result.put(('success', lastfm_data))
+                    return ('success', lastfm_data)
                 else:
-                    lastfm_result.put(('error', f"Last.fm返回错误: {lastfm_data.get('error')}"))
+                    return ('error', f"Last.fm返回错误: {lastfm_data.get('error')}")
             else:
-                lastfm_result.put(('error', f"Last.fm HTTP错误: {lastfm_response.status_code}"))
+                return ('error', f"Last.fm HTTP错误: {lastfm_response.status_code}")
         except requests.exceptions.Timeout:
-            lastfm_result.put(('timeout', None))
+            return ('timeout', None)
         except Exception as e:
-            lastfm_result.put(('error', e))
+            return ('error', e)
     
-    netease_thread = threading.Thread(target=fetch_netease_data)
-    lastfm_thread = threading.Thread(target=fetch_lastfm_data)
-    netease_thread.daemon = True
-    lastfm_thread.daemon = True
-    netease_thread.start()
-    lastfm_thread.start()
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        netease_future = executor.submit(fetch_netease_data)
+        lastfm_future = executor.submit(fetch_lastfm_data)
+        
+        # 等待两个任务完成，设置超时
+        try:
+            netease_result = netease_future.result(timeout=timeout)
+        except Exception as e:
+            netease_result = ('error', e)
+        
+        try:
+            lastfm_result = lastfm_future.result(timeout=timeout)
+        except Exception as e:
+            lastfm_result = ('error', e)
     
-    netease_thread.join(timeout=timeout)
-    lastfm_thread.join(timeout=timeout)
+    result.elapsed_time = time.time() - start_time
     
-    elapsed_time = time.time() - start_time
+    # 处理网易云结果
+    if netease_result[0] == 'success':
+        result.netease_data = netease_result[1]
+        result.netease_success = True
+    elif netease_result[0] == 'timeout':
+        result.netease_error = "Timeout"
+    elif netease_result[0] == 'error':
+        result.netease_error = netease_result[1]
     
-    if not netease_result.empty():
-        status, result = netease_result.get()
-        if status == 'success':
-            netease_data = result
-            netease_success = True
-        elif status == 'timeout':
-            netease_error = "Timeout"
-        elif status == 'error':
-            netease_error = result
-    else:
-        netease_error = "Timeout"
+    # 处理Last.fm结果
+    if lastfm_result[0] == 'success':
+        result.lastfm_data = lastfm_result[1]
+        result.lastfm_success = True
+    elif lastfm_result[0] == 'timeout':
+        result.lastfm_error = "Timeout"
+    elif lastfm_result[0] == 'error':
+        result.lastfm_error = lastfm_result[1]
     
-    if not lastfm_result.empty():
-        status, result = lastfm_result.get()
-        if status == 'success':
-            lastfm_data = result
-            lastfm_success = True
-        elif status == 'timeout':
-            lastfm_error = "Timeout"
-        elif status == 'error':
-            lastfm_error = result
-    else:
-        lastfm_error = "Timeout"
-    
-    return (netease_data, lastfm_data, netease_success, lastfm_success, elapsed_time, netease_error, lastfm_error)
+    return result
 
-def parallel_query_album_info(artist_name, album_name, lastfm_api_url, get_album_info_func, timeout=9):
-    """并行查询专辑信息（9秒超时）"""
-    netease_data = None
-    lastfm_data = None
-    netease_success = False
-    lastfm_success = False
-    netease_error = None
-    lastfm_error = None
-    
-    netease_result = Queue()
-    lastfm_result = Queue()
-    start_time = time.time()
-    
+def parallel_query_artist_info(artist_name: str, lastfm_api_url: str, 
+                               get_artist_profile_func: Callable, timeout: int = DEFAULT_TIMEOUT) -> QueryResult:
+    """并行查询艺术家信息"""
     def fetch_netease_data():
-        try:
-            album_info = get_album_info_func(artist_name, album_name)
-            if album_info:
-                netease_result.put(('success', album_info))
-            else:
-                netease_result.put(('no_data', None))
-        except Exception as e:
-            netease_result.put(('error', e))
+        artist_name_1 = None
+        if any(substring in artist_name for substring in [' and ', "&"]):
+            sp = re.split(r" and |&", artist_name)
+            artist_name_1 = sp[0]
+        
+        artist_profile = get_artist_profile_func(artist_name)
+        if not artist_profile and artist_name_1 is not None:
+            artist_profile = get_artist_profile_func(artist_name_1)
+        
+        if artist_profile:
+            return artist_profile['artist']
+        return None
     
-    def fetch_lastfm_data():
-        try:
-            lastfm_response = requests.get(lastfm_api_url, timeout=timeout)
-            if lastfm_response.status_code == 200:
-                lastfm_data = lastfm_response.json()
-                if 'error' not in lastfm_data:
-                    lastfm_result.put(('success', lastfm_data))
-                else:
-                    lastfm_result.put(('error', f"Last.fm返回错误: {lastfm_data.get('error')}"))
-            else:
-                lastfm_result.put(('error', f"Last.fm HTTP错误: {lastfm_response.status_code}"))
-        except requests.exceptions.Timeout:
-            lastfm_result.put(('timeout', None))
-        except Exception as e:
-            lastfm_result.put(('error', e))
-    
-    netease_thread = threading.Thread(target=fetch_netease_data)
-    lastfm_thread = threading.Thread(target=fetch_lastfm_data)
-    netease_thread.daemon = True
-    lastfm_thread.daemon = True
-    netease_thread.start()
-    lastfm_thread.start()
-    
-    netease_thread.join(timeout=timeout)
-    lastfm_thread.join(timeout=timeout)
-    
-    elapsed_time = time.time() - start_time
-    
-    if not netease_result.empty():
-        status, result = netease_result.get()
-        if status == 'success':
-            netease_data = result
-            netease_success = True
-        elif status == 'timeout':
-            netease_error = "Timeout"
-        elif status == 'error':
-            netease_error = result
-    else:
-        netease_error = "Timeout"
-    
-    if not lastfm_result.empty():
-        status, result = lastfm_result.get()
-        if status == 'success':
-            lastfm_data = result
-            lastfm_success = True
-        elif status == 'timeout':
-            lastfm_error = "Timeout"
-        elif status == 'error':
-            lastfm_error = result
-    else:
-        lastfm_error = "Timeout"
-    
-    return (netease_data, lastfm_data, netease_success, lastfm_success, elapsed_time, netease_error, lastfm_error)
+    return parallel_query(fetch_netease_data, lastfm_api_url, timeout)
 
-def parallel_query_artist_toptracks(artist_name, limit, lastfm_api_url, get_artist_top_songs_func, timeout=9):
-    """并行查询艺术家热门歌曲（9秒超时）"""
-    netease_data = None
-    lastfm_data = None
-    netease_success = False
-    lastfm_success = False
-    netease_error = None
-    lastfm_error = None
-    
-    netease_result = Queue()
-    lastfm_result = Queue()
-    start_time = time.time()
-    
+def parallel_query_album_info(artist_name: str, album_name: str, lastfm_api_url: str,
+                              get_album_info_func: Callable, timeout: int = DEFAULT_TIMEOUT) -> QueryResult:
+    """并行查询专辑信息"""
     def fetch_netease_data():
-        try:
-            top_songs = get_artist_top_songs_func(artist_name, limit)
-            if top_songs:
-                netease_result.put(('success', top_songs))
-            else:
-                netease_result.put(('no_data', None))
-        except Exception as e:
-            netease_result.put(('error', e))
+        return get_album_info_func(artist_name, album_name)
     
-    def fetch_lastfm_data():
-        try:
-            lastfm_response = requests.get(lastfm_api_url, timeout=timeout)
-            if lastfm_response.status_code == 200:
-                lastfm_data = lastfm_response.json()
-                if 'error' not in lastfm_data:
-                    lastfm_result.put(('success', lastfm_data))
-                else:
-                    lastfm_result.put(('error', f"Last.fm返回错误: {lastfm_data.get('error')}"))
-            else:
-                lastfm_result.put(('error', f"Last.fm HTTP错误: {lastfm_response.status_code}"))
-        except requests.exceptions.Timeout:
-            lastfm_result.put(('timeout', None))
-        except Exception as e:
-            lastfm_result.put(('error', e))
+    return parallel_query(fetch_netease_data, lastfm_api_url, timeout)
+
+def parallel_query_artist_toptracks(artist_name: str, limit: int, lastfm_api_url: str,
+                                    get_artist_top_songs_func: Callable, timeout: int = DEFAULT_TIMEOUT) -> QueryResult:
+    """并行查询艺术家热门歌曲"""
+    def fetch_netease_data():
+        return get_artist_top_songs_func(artist_name, limit)
     
-    netease_thread = threading.Thread(target=fetch_netease_data)
-    lastfm_thread = threading.Thread(target=fetch_lastfm_data)
-    netease_thread.daemon = True
-    lastfm_thread.daemon = True
-    netease_thread.start()
-    lastfm_thread.start()
-    
-    netease_thread.join(timeout=timeout)
-    lastfm_thread.join(timeout=timeout)
-    
-    elapsed_time = time.time() - start_time
-    
-    if not netease_result.empty():
-        status, result = netease_result.get()
-        if status == 'success':
-            netease_data = result
-            netease_success = True
-        elif status == 'timeout':
-            netease_error = "Timeout"
-        elif status == 'error':
-            netease_error = result
-    else:
-        netease_error = "Timeout"
-    
-    if not lastfm_result.empty():
-        status, result = lastfm_result.get()
-        if status == 'success':
-            lastfm_data = result
-            lastfm_success = True
-        elif status == 'timeout':
-            lastfm_error = "Timeout"
-        elif status == 'error':
-            lastfm_error = result
-    else:
-        lastfm_error = "Timeout"
-    
-    return (netease_data, lastfm_data, netease_success, lastfm_success, elapsed_time, netease_error, lastfm_error)
+    return parallel_query(fetch_netease_data, lastfm_api_url, timeout)
 
 
 # 缓存
-cache_dir = '/.cache'
+cache_dir = './.cache'
 # try:
 #     shutil.rmtree(cache_dir)
 # except FileNotFoundError:
@@ -264,38 +200,49 @@ cache_dir = '/.cache'
 
 cache = Cache(app, config={
     'CACHE_TYPE': 'filesystem',
-    'CACHE_DIR': cache_dir
+    'CACHE_DIR': cache_dir,
+    'CACHE_DEFAULT_TIMEOUT': 86400,  # 缓存默认过期时间（秒）
+    'CACHE_THRESHOLD': 1000  # 最大缓存项数，超过后会自动清理
 })
+
+# 创建全局 requests.Session 对象
+session = requests.Session()
 
 # 缓存键，解决缓存未忽略参数的情况 COPY FROM LRCAPI
 
-
 def make_cache_key(*args, **kwargs) -> str:
     path: str = request.path
-    args: str = str(hash(frozenset(request.args.items())))
-    return path + args
+    # 过滤掉敏感参数后再生成缓存键
+    filtered_args = filter_sensitive_params(request.args.to_dict(), redact=False)
+    args_hash: str = str(hash(frozenset(filtered_args.items())))
+    return path + args_hash
 
-
-def safe_query_string():
+def safe_query_string() -> str:
     """返回安全的查询字符串，隐藏敏感信息如api_key"""
-    query_dict = request.args.to_dict()
+    safe_dict = filter_sensitive_params(request.args.to_dict(), redact=True)
     
-    # 需要隐藏的敏感参数
-    sensitive_params = ['api_key', 'token', 'password', 'secret', 'key']
+    # 构建查询字符串，但不进行URL编码
+    # 这样日志中会显示解码后的中文，而不是URL编码
+    query_parts = []
+    for key, value in safe_dict.items():
+        query_parts.append(f"{key}={value}")
     
-    safe_dict = {}
-    for key, value in query_dict.items():
-        # 检查是否是敏感参数
-        is_sensitive = any(sensitive in key.lower() for sensitive in sensitive_params)
-        if is_sensitive:
-            safe_dict[key] = '[REDACTED]'
-        else:
-            safe_dict[key] = value
-    
-    # 构建查询字符串
-    from urllib.parse import urlencode
-    return urlencode(safe_dict)
+    return "&".join(query_parts)
 
+
+@app.route('/clear_cache', methods=['POST'])
+def clear_cache():
+    """清空缓存目录"""
+    try:
+        shutil.rmtree(cache_dir)
+        # 重新创建缓存目录
+        import os
+        os.makedirs(cache_dir, exist_ok=True)
+        app.logger.info("缓存已清空")
+        return jsonify({"status": "success", "message": "缓存已清空"}), 200
+    except Exception as e:
+        app.logger.error(f"清空缓存时出错: {e}")
+        return jsonify({"status": "error", "message": str(e)}), 500
 
 @app.route('/lastfm/', methods=['GET', 'POST'])
 @cache.cached(timeout=86400, key_prefix=make_cache_key)
@@ -303,56 +250,46 @@ def proxy_lastfm():
     lastfm_api_url = f"https://ws.audioscrobbler.com/2.0/?{request.query_string.decode('utf-8')}"
 
     if request.method == "POST":
-        resp = requests.post(lastfm_api_url, json=None, headers=request.headers)
+        resp = session.post(lastfm_api_url, json=None, headers=request.headers)
         app.logger.info(f"{resp.status_code} POST /lastfm/?{safe_query_string()}")
         return jsonify(resp.json()), resp.status_code
 
     method = request.args.get('method')
-    if method.lower() == "artist.getinfo":
+    if not method:
+        abort(400, {"code": 400, "message": "缺少 method 参数"})
+    
+    method = method.lower()
+    
+    if method == "artist.getinfo":
         artist_name = request.args.get('artist')
+        if not artist_name:
+            abort(400, {"code": 400, "message": "缺少 artist 参数"})
         
-        # 并行查询网易云和Last.fm数据（9秒超时）
-        (netease_data, lastfm_data, netease_success, lastfm_success, 
-         elapsed_time, netease_error, lastfm_error) = parallel_query_artist_info(
+        # 并行查询网易云和Last.fm数据
+        query_result = parallel_query_artist_info(
             artist_name=artist_name,
             lastfm_api_url=lastfm_api_url,
             get_artist_profile_func=get_artist_profile,
-            timeout=9  # 9秒超时，留1秒业务处理时间
+            timeout=DEFAULT_TIMEOUT
         )
         
-        app.logger.debug(f"artist.getinfo并行查询总耗时: {elapsed_time:.2f}秒")
+        # 使用通用日志记录函数
+        log_query_result("artist.getinfo", query_result.netease_success, query_result.lastfm_success,
+                        query_result.netease_error, query_result.lastfm_error, artist_name, query_result.elapsed_time)
         
-        # 记录查询结果
-        if netease_success:
-            app.logger.debug(f"成功获取网易云数据: {artist_name}")
-        elif netease_error:
-            if netease_error == "Timeout":
-                app.logger.warning(f"网易云API查询超时（9秒限制）: {artist_name}")
-            else:
-                app.logger.error(f"网易云API查询异常: {netease_error}")
-                app.logger.error(traceback.format_exc())
-        
-        if lastfm_success:
-            app.logger.debug(f"成功获取Last.fm数据: {artist_name}")
-        elif lastfm_error:
-            if lastfm_error == "Timeout":
-                app.logger.warning(f"Last.fm查询超时（9秒限制）: {artist_name}")
-            else:
-                app.logger.error(f"Last.fm查询异常: {lastfm_error}")
-        
-        # 根据获取的数据情况决定返回什么（保留原方案的数据合并逻辑）
-        if lastfm_success:
+        # 根据获取的数据情况决定返回什么
+        if query_result.lastfm_success:
             # 有Last.fm数据，以其为模板
-            result = lastfm_data
+            result = query_result.lastfm_data
             
             # 如果有网易云数据，用网易云数据补充（网易云数据优先）
-            if netease_success:
+            if query_result.netease_success:
                 # 替换image标签为网易云数据
                 artist_result = result['artist']
                 
                 # 获取网易云图片URL
-                netease_img1v1 = netease_data.get('img1v1Url', '')
-                netease_pic = netease_data.get('picUrl', '')
+                netease_img1v1 = query_result.netease_data.get('img1v1Url', '')
+                netease_pic = query_result.netease_data.get('picUrl', '')
                 
                 # 更新image数组
                 if 'image' in artist_result:
@@ -365,7 +302,7 @@ def proxy_lastfm():
                 
                 # 更新bio summary
                 if 'bio' in artist_result:
-                    netease_brief = netease_data.get('briefDesc', '')
+                    netease_brief = query_result.netease_data.get('briefDesc', '')
                     if netease_brief:
                         artist_result['bio']['summary'] = netease_brief
                         artist_result['bio']['content'] = netease_brief
@@ -376,12 +313,11 @@ def proxy_lastfm():
             
             return jsonify(result)
         
-        elif netease_success:
+        elif query_result.netease_success:
             # 只有网易云数据，构建Last.fm格式的响应
-            # 以标准Last.fm结构为模板，填充网易云数据
-            netease_img1v1 = netease_data.get('img1v1Url', '')
-            netease_pic = netease_data.get('picUrl', '')
-            netease_brief = netease_data.get('briefDesc', '')
+            netease_img1v1 = query_result.netease_data.get('img1v1Url', '')
+            netease_pic = query_result.netease_data.get('picUrl', '')
+            netease_brief = query_result.netease_data.get('briefDesc', '')
             
             # 构建标准Last.fm结构
             lastfm_resp = {
@@ -389,14 +325,7 @@ def proxy_lastfm():
                     "name": artist_name,
                     "mbid": "",  # 网易云没有mbid
                     "url": f"https://www.last.fm/music/{artist_name.replace(' ', '+')}",
-                    "image": [
-                        {"#text": netease_img1v1, "size": "small"},
-                        {"#text": netease_img1v1, "size": "medium"},
-                        {"#text": netease_pic, "size": "large"},
-                        {"#text": netease_pic, "size": "extralarge"},
-                        {"#text": netease_pic, "size": "mega"},
-                        {"#text": netease_pic, "size": ""}
-                    ],
+                    "image": build_image_array(netease_img1v1, netease_pic),
                     "streamable": "0",
                     "ontour": "0",
                     "stats": {
@@ -431,55 +360,42 @@ def proxy_lastfm():
             # 两者都没有数据，返回400错误
             app.logger.info(f"400 GET /lastfm/?{safe_query_string()}")
             abort(400, {"code": 400, "message": f"无法查询到艺术家 {artist_name}"})
-    elif method.lower() == "album.getinfo":
+    elif method == "album.getinfo":
         # 从请求参数中获取专辑和艺术家信息
         artist_name = request.args.get('artist')
         album_name = request.args.get('album')
         mbid = request.args.get('mbid', "")
         
-        # 并行查询网易云和Last.fm数据（9秒超时）
-        (netease_data, lastfm_data, netease_success, lastfm_success, 
-         elapsed_time, netease_error, lastfm_error) = parallel_query_album_info(
+        if not artist_name or not album_name:
+            abort(400, {"code": 400, "message": "缺少 artist 或 album 参数"})
+        
+        # 并行查询网易云和Last.fm数据
+        query_result = parallel_query_album_info(
             artist_name=artist_name,
             album_name=album_name,
             lastfm_api_url=lastfm_api_url,
             get_album_info_func=get_album_info,
-            timeout=9  # 9秒超时
+            timeout=DEFAULT_TIMEOUT
         )
         
-        app.logger.debug(f"album.getinfo并行查询总耗时: {elapsed_time:.2f}秒")
+        # 使用通用日志记录函数
+        identifier = f"{artist_name} - {album_name}"
+        log_query_result("album.getinfo", query_result.netease_success, query_result.lastfm_success,
+                        query_result.netease_error, query_result.lastfm_error, identifier, query_result.elapsed_time)
         
-        # 记录查询结果
-        if netease_success:
-            app.logger.debug(f"成功获取网易云专辑数据: {artist_name} - {album_name}")
-        elif netease_error:
-            if netease_error == "Timeout":
-                app.logger.warning(f"网易云API查询超时（9秒限制）: {artist_name} - {album_name}")
-            else:
-                app.logger.error(f"网易云API查询异常: {netease_error}")
-                app.logger.error(traceback.format_exc())
-        
-        if lastfm_success:
-            app.logger.debug(f"成功获取Last.fm专辑数据: {artist_name} - {album_name}")
-        elif lastfm_error:
-            if lastfm_error == "Timeout":
-                app.logger.warning(f"Last.fm查询超时（9秒限制）: {artist_name} - {album_name}")
-            else:
-                app.logger.error(f"Last.fm查询异常: {lastfm_error}")
-        
-        # 根据获取的数据情况决定返回什么（保留原方案的数据合并逻辑）
-        if lastfm_success:
+        # 根据获取的数据情况决定返回什么
+        if query_result.lastfm_success:
             # 有Last.fm数据，以其为模板
-            result = lastfm_data
+            result = query_result.lastfm_data
             
             # 如果有网易云数据，用网易云数据补充（网易云数据优先）
-            if netease_success:
+            if query_result.netease_success:
                 # 替换image标签为网易云数据
                 album_result = result['album']
                 
                 # 获取网易云图片URL
-                netease_blur_pic = netease_data.get('blurPicUrl', '')
-                netease_pic = netease_data.get('picUrl', '')
+                netease_blur_pic = query_result.netease_data.get('blurPicUrl', '')
+                netease_pic = query_result.netease_data.get('picUrl', '')
                 
                 # 更新image数组
                 if 'image' in album_result:
@@ -492,7 +408,7 @@ def proxy_lastfm():
                 
                 # 更新wiki summary
                 if 'wiki' in album_result:
-                    netease_desc = netease_data.get('description', '')
+                    netease_desc = query_result.netease_data.get('description', '')
                     if netease_desc:
                         album_result['wiki']['summary'] = netease_desc
                         album_result['wiki']['content'] = netease_desc
@@ -506,11 +422,11 @@ def proxy_lastfm():
             
             return jsonify(result)
         
-        elif netease_success:
+        elif query_result.netease_success:
             # 只有网易云数据，构建Last.fm格式的响应
-            netease_blur_pic = netease_data.get('blurPicUrl', '')
-            netease_pic = netease_data.get('picUrl', '')
-            netease_desc = netease_data.get('description', '')
+            netease_blur_pic = query_result.netease_data.get('blurPicUrl', '')
+            netease_pic = query_result.netease_data.get('picUrl', '')
+            netease_desc = query_result.netease_data.get('description', '')
             
             # 构建标准Last.fm结构
             lastfm_resp = {
@@ -519,14 +435,7 @@ def proxy_lastfm():
                     "artist": artist_name,
                     "mbid": mbid,
                     "url": f"https://www.last.fm/music/{artist_name.replace(' ', '+')}/{album_name.replace(' ', '+')}",
-                    "image": [
-                        {"#text": netease_blur_pic, "size": "small"},
-                        {"#text": netease_blur_pic, "size": "medium"},
-                        {"#text": netease_pic, "size": "large"},
-                        {"#text": netease_pic, "size": "extralarge"},
-                        {"#text": netease_pic, "size": "mega"},
-                        {"#text": netease_pic, "size": ""}
-                    ],
+                    "image": build_image_array(netease_blur_pic, netease_pic),
                     "listeners": "0",
                     "playcount": "0",
                     "tracks": {
@@ -553,46 +462,32 @@ def proxy_lastfm():
             # 两者都没有数据，返回400错误
             app.logger.info(f"400 GET /lastfm/?{safe_query_string()}")
             abort(400, {"code": 400, "message": f"无法查询到专辑 {album_name} (艺术家: {artist_name})"})
-    elif method.lower() == "artist.gettoptracks":
+    elif method == "artist.gettoptracks":
         # 获取艺术家热门歌曲
         artist_name = request.args.get('artist')
         limit = int(request.args.get('limit', 50))
         
-        # 并行查询网易云和Last.fm数据（9秒超时）
-        (netease_data, lastfm_data, netease_success, lastfm_success, 
-         elapsed_time, netease_error, lastfm_error) = parallel_query_artist_toptracks(
+        if not artist_name:
+            abort(400, {"code": 400, "message": "缺少 artist 参数"})
+        
+        # 并行查询网易云和Last.fm数据
+        query_result = parallel_query_artist_toptracks(
             artist_name=artist_name,
             limit=limit,
             lastfm_api_url=lastfm_api_url,
             get_artist_top_songs_func=get_artist_top_songs,
-            timeout=9  # 9秒超时
+            timeout=DEFAULT_TIMEOUT
         )
         
-        app.logger.debug(f"artist.gettoptracks并行查询总耗时: {elapsed_time:.2f}秒")
+        # 使用通用日志记录函数
+        log_query_result("artist.gettoptracks", query_result.netease_success, query_result.lastfm_success,
+                        query_result.netease_error, query_result.lastfm_error, artist_name, query_result.elapsed_time)
         
-        # 记录查询结果
-        if netease_success:
-            app.logger.debug(f"成功获取网易云热门歌曲数据: {artist_name}")
-        elif netease_error:
-            if netease_error == "Timeout":
-                app.logger.warning(f"网易云查询超时（9秒限制）: {artist_name}")
-            else:
-                app.logger.error(f"网易云API查询异常: {netease_error}")
-                app.logger.error(traceback.format_exc())
-        
-        if lastfm_success:
-            app.logger.debug(f"成功获取Last.fm热门歌曲数据: {artist_name}")
-        elif lastfm_error:
-            if lastfm_error == "Timeout":
-                app.logger.warning(f"Last.fm查询超时（9秒限制）: {artist_name}")
-            else:
-                app.logger.error(f"Last.fm查询异常: {lastfm_error}")
-        
-        # 根据获取的数据情况决定返回什么（保留原方案的优先逻辑）
+        # 根据获取的数据情况决定返回什么
         # 1. 如果有网易云数据，以网易云数据填充Last.fm格式，抛弃Last.fm数据
-        if netease_success:
+        if query_result.netease_success:
             tracks = []
-            for i, song in enumerate(netease_data[:limit]):
+            for i, song in enumerate(query_result.netease_data[:limit]):
                 track = {
                     "name": song.get('name', ''),
                     "duration": str(song.get('duration', 0)),
@@ -604,14 +499,10 @@ def proxy_lastfm():
                         "mbid": "",
                         "url": f"https://www.last.fm/music/{artist_name.replace(' ', '+')}"
                     },
-                    "image": [
-                        {"#text": song.get('album', {}).get('picUrl', ''), "size": "small"},
-                        {"#text": song.get('album', {}).get('picUrl', ''), "size": "medium"},
-                        {"#text": song.get('album', {}).get('picUrl', ''), "size": "large"},
-                        {"#text": song.get('album', {}).get('picUrl', ''), "size": "extralarge"},
-                        {"#text": song.get('album', {}).get('picUrl', ''), "size": "mega"},
-                        {"#text": song.get('album', {}).get('picUrl', ''), "size": ""}
-                    ],
+                    "image": build_image_array(
+                        song.get('album', {}).get('picUrl', ''),
+                        song.get('album', {}).get('picUrl', '')
+                    ),
                     "@attr": {
                         "rank": str(i + 1)
                     }
@@ -635,9 +526,9 @@ def proxy_lastfm():
             return jsonify(lastfm_resp)
         
         # 2. 如果网易云超时/无数据，但Last.fm有数据，使用Last.fm数据
-        elif lastfm_success:
+        elif query_result.lastfm_success:
             app.logger.info(f"200 GET /lastfm/?{safe_query_string()} (网易云无数据，使用Last.fm)")
-            return jsonify(lastfm_data)
+            return jsonify(query_result.lastfm_data)
         
         # 3. 两者都没有数据，返回400错误
         else:
